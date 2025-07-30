@@ -597,3 +597,7 @@ class TargetBigQuery(Target):
     # behaviour to use orjson directly
     def deserialize_json(self, line):
         return orjson.loads(line)
+
+
+if __name__ == "__main__":
+    TargetBigQuery.cli()
