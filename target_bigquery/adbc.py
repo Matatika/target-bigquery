@@ -10,15 +10,8 @@
 # substantial portions of the Software.
 """ADBC connectivity for Arrow BATCH ingestion (encoding.format == "arrow").
 
-``pyarrow`` and ``adbc-driver-manager`` are regular (required) dependencies of this
-package -- both are pure-wheel and pip-installable. The native BigQuery ADBC driver itself
-is *not* pip-installable, though, and must be installed separately via ``dbc install
-bigquery`` (the CLI that ships with ``adbc-driver-manager`` - see
-https://docs.adbc-drivers.org/drivers/bigquery/). Arrow BATCH mode fails fast with an
-actionable error (see ``require_arrow_support``) if that native driver isn't present.
-
-Nothing in this module is imported eagerly by the rest of the target; it is only touched
-when a BATCH message with ``encoding.format == "arrow"`` is actually received.
+The native BigQuery ADBC driver isn't pip-installable; install it separately via
+``dbc install bigquery`` (see https://docs.adbc-drivers.org/drivers/bigquery/).
 """
 
 import json
@@ -37,12 +30,7 @@ class ArrowSupportError(RuntimeError):
 
 
 def require_arrow_support() -> None:
-    """Eagerly validate Arrow/ADBC support is usable.
-
-    Raises ArrowSupportError with an actionable message if the native BigQuery ADBC driver
-    can't be loaded. Called before any Arrow BATCH file is processed, so failures surface
-    immediately rather than mid-batch.
-    """
+    """Raise ArrowSupportError if the native BigQuery ADBC driver can't be loaded."""
     try:
         db = AdbcDatabase(driver="bigquery")
     except Exception as exc:  # pylint: disable=broad-except
@@ -57,11 +45,7 @@ def require_arrow_support() -> None:
 
 
 def _db_kwargs(credentials: "BigQueryCredentials", dataset: str, location: str | None) -> dict:
-    """Map BigQueryCredentials + target config to the driver's `bigquery.*` db_kwargs.
-
-    Reuses the same config keys as bigquery_client_factory (credentials_path/
-    credentials_json/project) -- no new config keys introduced for ADBC connectivity.
-    """
+    """Map BigQueryCredentials + target config to the driver's `bigquery.*` db_kwargs."""
     kwargs: dict = {"bigquery.project_id": credentials.project, "bigquery.dataset_id": dataset}
     if location:
         kwargs["bigquery.location"] = location
@@ -97,8 +81,7 @@ def ingest(
 ) -> int:
     """Bulk-append an Arrow table into an existing BigQuery table via ADBC.
 
-    Always ``mode="append"``: table creation/DDL (schema, partitioning, clustering) stays
-    owned by ``BigQueryTable.create_table``, never by ADBC.
+    Always mode="append" -- table DDL stays owned by BigQueryTable.create_table.
     """
     with conn.cursor() as cur:
         return cur.adbc_ingest(table_name, table, mode="append", db_schema_name=dataset)
