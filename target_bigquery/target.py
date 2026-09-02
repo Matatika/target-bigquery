@@ -15,21 +15,18 @@ from __future__ import annotations
 import copy
 import time
 import uuid
+from collections.abc import Callable
 from typing import (
     TYPE_CHECKING,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Tuple,
-    Type,
-    Union,
+    ClassVar,
     cast,
 )
 
 import orjson
 from singer_sdk import Sink
 from singer_sdk import typing as th
+from singer_sdk.helpers.capabilities import CapabilitiesEnum, PluginCapabilities
+from singer_sdk.io_base import SingerReader
 from singer_sdk.target_base import Target
 
 from target_bigquery.batch_job import (
@@ -70,12 +67,31 @@ WORKER_CREATION_MIN_INTERVAL = 5
 """Minimum time between worker creation attempts."""
 
 
+class OrjsonSingerReader(SingerReader):
+    """Message reader that uses orjson for line parsing.
+
+    The SDK's default message reader (singer_sdk.singerlib.json.deserialize_json) parses
+    JSON numbers with parse_float=decimal.Decimal, to preserve precision. orjson doesn't
+    support serializing decimal.Decimal back out (used throughout this target to write
+    records to BigQuery), so parse with orjson instead -- which always produces native
+    float -- avoiding that mismatch entirely.
+    """
+
+    def deserialize_json(self, line: str) -> dict:
+        return orjson.loads(line)
+
+
 class TargetBigQuery(Target):
     """Target for BigQuery."""
 
     _MAX_RECORD_AGE_IN_MINUTES = 5.0
 
     name = "target-bigquery"
+    package_name = "z3-target-bigquery"
+    capabilities: ClassVar[list[CapabilitiesEnum]] = [
+        *Target.capabilities,
+        PluginCapabilities.BATCH,
+    ]
     config_jsonschema = th.PropertiesList(
         th.Property(
             "credentials_path",
@@ -374,7 +390,7 @@ class TargetBigQuery(Target):
 
         def worker_factory():
             return cast(
-                Type[BaseWorker],
+                type[BaseWorker],
                 self.get_sink_class().worker_cls_factory(
                     self.proc_cls,
                     dict(self.config),
@@ -389,8 +405,8 @@ class TargetBigQuery(Target):
             )
 
         self.worker_factory = worker_factory
-        self.workers: List[Union[BaseWorker, "Process"]] = []
-        self.worker_pings: Dict[str, float] = {}
+        self.workers: list[BaseWorker | Process] = []
+        self.worker_pings: dict[str, float] = {}
         self._jobs_enqueued = 0
         self._last_worker_creation = 0.0
 
@@ -404,14 +420,14 @@ class TargetBigQuery(Target):
 
     def get_parallelization_components(
         self, default=ParType.THREAD
-    ) -> Tuple[
-        Type["Process"],
-        Callable[[bool], Tuple["Connection", "Connection"]],
-        Callable[[], "Queue"],
+    ) -> tuple[
+        type[Process],
+        Callable[[bool], tuple[Connection, Connection]],
+        Callable[[], Queue],
         ParType,
     ]:
         """Get the appropriate Process, Pipe, and Queue classes and the assoc ParTyp enum."""
-        use_procs: Optional[bool] = self.config.get("options", {}).get("process_pool")
+        use_procs: bool | None = self.config.get("options", {}).get("process_pool")
 
         if use_procs is None:
             use_procs = default == ParType.PROCESS
@@ -437,9 +453,7 @@ class TargetBigQuery(Target):
         """Predicate determining when it is valid to add a worker to the pool."""
         return (
             self._jobs_enqueued
-            > getattr(
-                self.get_sink_class(), "WORKER_CAPACITY_FACTOR", WORKER_CAPACITY_FACTOR
-            )
+            > getattr(self.get_sink_class(), "WORKER_CAPACITY_FACTOR", WORKER_CAPACITY_FACTOR)
             * (len(self.workers) + 1)
             and len(self.workers)
             < self.config.get("options", {}).get(
@@ -484,9 +498,7 @@ class TargetBigQuery(Target):
 
     # SDK overrides to inject our worker management logic and sink selection.
 
-    def get_sink_class(
-        self, stream_name: Optional[str] = None
-    ) -> Type[BaseBigQuerySink]:
+    def get_sink_class(self, stream_name: str | None = None) -> type[BaseBigQuerySink]:
         """Returns the sink class to use for a given stream based on user config."""
         _ = stream_name
         method, denormalized = (
@@ -515,9 +527,9 @@ class TargetBigQuery(Target):
         self,
         stream_name: str,
         *,
-        record: Optional[dict] = None,
-        schema: Optional[dict] = None,
-        key_properties: Optional[List[str]] = None,
+        record: dict | None = None,
+        schema: dict | None = None,
+        key_properties: list[str] | None = None,
     ) -> Sink:
         """Get a sink for a stream. If the sink does not exist, create it. This override skips sink recreation
         on schema change. Meaningful mid stream schema changes are not supported and extremely rare to begin
@@ -556,7 +568,9 @@ class TargetBigQuery(Target):
                     # greater than the downside for now but will revisit this.
                     self.logger.error("Draining all sinks and terminating.")
                     self.drain_all(is_endofpipe=True)
-                except Exception:
+                except Exception:  # noqa: BLE001 -- best-effort drain before the
+                    # RuntimeError below is raised regardless; any failure here shouldn't
+                    # mask the original error.
                     self.logger.error("Drain failed.")
                 raise RuntimeError(msg) from e
             else:
@@ -587,13 +601,8 @@ class TargetBigQuery(Target):
             self._write_state_message(state)
         self._reset_max_record_age()
 
-    def _validate_config(
-        self, raise_errors: bool = True, warnings_as_errors: bool = False
-    ) -> Tuple[List[str], List[str]]:
+    def _validate_config(self, *, raise_errors: bool = True) -> list[str]:
         """Don't throw on config validation since our JSON schema doesn't seem to play well with meltano for whatever reason"""
         return super()._validate_config(raise_errors=False)
 
-    # orjson does not support decimal.Decimal, so just override deserialization
-    # behaviour to use orjson directly
-    def deserialize_json(self, line):
-        return orjson.loads(line)
+    message_reader_class = OrjsonSingerReader

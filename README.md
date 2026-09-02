@@ -196,8 +196,7 @@ tap-carbon-intensity | target-bigquery --config /path/to/target-bigquery-config.
 ### Initialize your Development Environment
 
 ```bash
-pipx install poetry
-poetry install
+uv sync
 ```
 
 ### Create and Run Tests
@@ -206,14 +205,33 @@ Create tests within the `target_bigquery/tests` subfolder and
   then run:
 
 ```bash
-poetry run pytest
+uv run pytest
 ```
 
-You can also test the `target-bigquery` CLI interface directly using `poetry run`:
+You can also test the `target-bigquery` CLI interface directly using `uv run`:
 
 ```bash
-poetry run target-bigquery --help
+uv run target-bigquery --help
 ```
+
+### Arrow BATCH support
+
+`target-bigquery` accepts Singer `BATCH` messages with `encoding: {"format": "arrow"}` --
+the manifest's Arrow IPC files are ingested directly via [ADBC](https://arrow.apache.org/adbc/)
+instead of row-by-row, independent of the configured `method`. This requires `denormalized:
+true` (the fixed JSON-blob schema strategy can't be bulk-loaded columnarly and fails fast if
+sent Arrow BATCH data).
+
+`pyarrow` and `adbc-driver-manager` (the Python DBAPI shim) are installed automatically as
+regular dependencies of this package. The one separate step is the native BigQuery ADBC
+driver itself, which isn't distributed on PyPI:
+
+```bash
+dbc install bigquery  # or: just dbc
+```
+
+See [docs.adbc-drivers.org/drivers/bigquery](https://docs.adbc-drivers.org/drivers/bigquery/)
+for the `dbc` CLI (which ships with `adbc-driver-manager`) and driver details.
 
 ### Testing with [Meltano](https://meltano.com/)
 

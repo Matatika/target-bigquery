@@ -1,4 +1,4 @@
-version: 1
+requires_meltano: '>=4.2'
 send_anonymous_usage_stats: true
 project_id: target-bigquery
 default_environment: testing
@@ -6,29 +6,21 @@ environments:
 - name: testing
 plugins:
   extractors:
-  - name: tap-infinity
-    namespace: tap_infinity
-    pip_url: git+https://github.com/spacecowboy/tap-infinity.git
-    capabilities:
-    - catalog
-    - discover
-    - batch
-    - test
-    - about
+  - name: "tap-smoke-test"
+    namespace: "tap_smoke_test"
+    executable: "tap-smoke-test"
+    pip_url: "git+https://github.com/meltano/tap-smoke-test.git"
     config:
-      row_count: 1000000
-      column_count: 150
-      batch_size: 1000000
-      batch_config:
-        encoding:
-          format: jsonl
-          compression: gzip
-        storage:
-          root: file://
-          prefix: ''
-  - name: tap-carbon-intensity
-    variant: meltano
-    pip_url: git+https://gitlab.com/meltano/tap-carbon-intensity.git
+      streams:
+      - stream_name: animals
+        "input_filename": "https://gitlab.com/meltano/tap-smoke-test/-/raw/main/demo-data/animals-data.jsonl"
+      - stream_name: page_views
+        "input_filename": "https://gitlab.com/meltano/tap-smoke-test/-/raw/main/demo-data/pageviews-data.jsonl"
+      stream_maps:
+        "animals":
+          "__key_properties__": ["id"]
+        "page_views":
+          "__key_properties__": ["vistor_id"]
   loaders:
   - name: target-bigquery
     namespace: target_bigquery
@@ -42,7 +34,7 @@ plugins:
       project: ${BQ_PROJECT}
       method: storage_write_api
       denormalized: true
-      credentials_path: ${HOME}/.gcp/dwh-credentials.json
-      dataset: raw_testing
+      credentials_json: ${BQ_CREDS}
+      dataset: target_bigquery_tests
       batch_size: 500
       timeout: 300

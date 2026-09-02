@@ -11,6 +11,7 @@
 """BigQuery Storage Write Sink."""
 
 import os
+from collections.abc import Callable
 from multiprocessing import Process
 from multiprocessing.connection import Connection
 from multiprocessing.dummy import Process as _Thread
@@ -19,14 +20,6 @@ from time import sleep
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Set,
-    Tuple,
-    Type,
-    Union,
     cast,
 )
 
@@ -56,16 +49,14 @@ MAX_IN_FLIGHT = 15
 """Maximum number of concurrent requests per worker be processed by grpc before awaiting."""
 
 Dispatcher = Callable[[types.AppendRowsRequest], writer.AppendRowsFuture]
-StreamComponents = Tuple[Field, writer.AppendRowsStream, Dispatcher]
+StreamComponents = tuple[Field, writer.AppendRowsStream, Dispatcher]
 
 
 def get_application_stream(client: BigQueryWriteClient, job: "Job") -> StreamComponents:
     """Get an application created stream for the parent. This stream must be finalized and committed."""
     write_stream = types.WriteStream()
-    write_stream.type_ = types.WriteStream.Type.PENDING  # type: ignore
-    write_stream = client.create_write_stream(
-        parent=job.parent, write_stream=write_stream
-    )
+    write_stream.type_ = types.WriteStream.Type.PENDING
+    write_stream = client.create_write_stream(parent=job.parent, write_stream=write_stream)
     job.template.write_stream = write_stream.name
     append_rows_stream = writer.AppendRowsStream(client, job.template)
     rv = (write_stream.name, append_rows_stream)
@@ -79,7 +70,7 @@ def get_application_stream(client: BigQueryWriteClient, job: "Job") -> StreamCom
 
 def get_default_stream(client: BigQueryWriteClient, job: "Job") -> StreamComponents:
     """Get the default storage write API stream for the parent."""
-    job.template.write_stream = BigQueryWriteClient.write_stream_path(  # type: ignore
+    job.template.write_stream = BigQueryWriteClient.write_stream_path(
         **BigQueryWriteClient.parse_table_path(job.parent), stream="_default"
     )
     append_rows_stream = writer.AppendRowsStream(client, job.template)
@@ -94,22 +85,22 @@ def get_default_stream(client: BigQueryWriteClient, job: "Job") -> StreamCompone
 
 def generate_request(
     payload: types.ProtoRows,
-    offset: Optional[int] = None,
-    path: Optional[str] = None,
+    offset: int | None = None,
+    path: str | None = None,
 ) -> types.AppendRowsRequest:
     """Generate a request for the storage write API from a payload."""
     request = types.AppendRowsRequest()
     if offset is not None:
-        request.offset = int(offset)  # type: ignore
+        request.offset = int(offset)
     if path is not None:
-        request.write_stream = path  # type: ignore
+        request.write_stream = path
     proto_data = types.AppendRowsRequest.ProtoData()
-    proto_data.rows = payload  # type: ignore
-    request.proto_rows = proto_data  # type: ignore
+    proto_data.rows = payload
+    request.proto_rows = proto_data
     return request
 
 
-def generate_template(message: Type[message.Message]):
+def generate_template(message: type[message.Message]):
     """Generate a template for the storage write API from a proto message class."""
     from google.protobuf import descriptor_pb2
 
@@ -117,12 +108,12 @@ def generate_template(message: Type[message.Message]):
         types.AppendRowsRequest(),
         types.ProtoSchema(),
         descriptor_pb2.DescriptorProto(),
-        types.AppendRowsRequest.ProtoData(),  # type: ignore
+        types.AppendRowsRequest.ProtoData(),
     )
     message.DESCRIPTOR.CopyToProto(proto_descriptor)
-    proto_schema.proto_descriptor = proto_descriptor  # type: ignore
-    proto_data.writer_schema = proto_schema  # type: ignore
-    template.proto_rows = proto_data  # type: ignore
+    proto_schema.proto_descriptor = proto_descriptor
+    proto_data.writer_schema = proto_schema
+    template.proto_rows = proto_data
     return template
 
 
@@ -153,10 +144,10 @@ class StorageWriteBatchWorker(BaseWorker):
         """Initialize the worker process."""
         super().__init__(*args, **kwargs)
         self.get_stream_components = get_application_stream
-        self.awaiting: List[writer.AppendRowsFuture] = []
-        self.cache: Dict[str, StreamComponents] = {}
+        self.awaiting: list[writer.AppendRowsFuture] = []
+        self.cache: dict[str, StreamComponents] = {}
         self.max_errors_before_recycle = 5
-        self.offsets: Dict[str, int] = {}
+        self.offsets: dict[str, int] = {}
         self.logger = logger
 
     def run(self):
@@ -169,7 +160,7 @@ class StorageWriteBatchWorker(BaseWorker):
             bidi_logger.setLevel(logging.INFO)
         while True:
             try:
-                job: Optional[Job] = self.queue.get(timeout=30.0)
+                job: Job | None = self.queue.get(timeout=30.0)
             except Empty:
                 break
             if job is None:
@@ -177,7 +168,7 @@ class StorageWriteBatchWorker(BaseWorker):
             if job.parent not in self.cache or self.cache[job.parent][1]._closed:
                 self.cache[job.parent] = self.get_stream_components(client, job)
                 self.offsets[job.parent] = 0
-            write_stream, _, dispatch = cast(StreamComponents, self.cache[job.parent])
+            write_stream, _, dispatch = self.cache[job.parent]
 
             try:
                 kwargs = {}
@@ -208,10 +199,10 @@ class StorageWriteBatchWorker(BaseWorker):
                     raise
             else:
                 self.log_notifier.send(
-                    f"[{self.ext_id}] Sent {len(job.data.serialized_rows)} rows to {write_stream}"  # type: ignore
+                    f"[{self.ext_id}] Sent {len(job.data.serialized_rows)} rows to {write_stream}"
                     f" with offset {self.offsets[job.parent]}."
                 )
-                self.offsets[job.parent] += len(job.data.serialized_rows)  # type: ignore
+                self.offsets[job.parent] += len(job.data.serialized_rows)
                 if len(self.awaiting) > MAX_IN_FLIGHT:
                     self.wait()
             finally:
@@ -226,9 +217,15 @@ class StorageWriteBatchWorker(BaseWorker):
     def close_cached_streams(self) -> None:
         """Close all cached streams."""
         for _, stream, _ in self.cache.values():
+            if stream._closed:
+                # Already closed by the sink's commit_streams (they share the same
+                # AppendRowsStream object via stream_notifier) -- closing again raises
+                # StreamClosedError instead of being a no-op.
+                continue
             try:
                 stream.close()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 -- worker loop: route any failure
+                # to error_notifier instead of crashing the worker process/thread.
                 self.error_notifier.send((exc, self.serialize_exception(exc)))
 
     def wait(self, drain: bool = False) -> None:
@@ -236,7 +233,8 @@ class StorageWriteBatchWorker(BaseWorker):
         while self.awaiting and ((len(self.awaiting) > MAX_IN_FLIGHT // 2) or drain):
             try:
                 self.awaiting.pop(0).result()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 -- worker loop: route any failure
+                # to error_notifier instead of crashing the worker process/thread.
                 self.error_notifier.send((exc, self.serialize_exception(exc)))
             finally:
                 self.job_notifier.send(True)
@@ -272,30 +270,28 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
 
     @staticmethod
     def worker_cls_factory(
-        worker_executor_cls: Type[Process], config: Dict[str, Any]
-    ) -> Type[
-        Union[
-            StorageWriteThreadStreamWorker,
-            StorageWriteProcessStreamWorker,
-            StorageWriteThreadBatchWorker,
-            StorageWriteProcessBatchWorker,
-        ]
+        worker_executor_cls: type[Process], config: dict[str, Any]
+    ) -> type[
+        StorageWriteThreadStreamWorker
+        | StorageWriteProcessStreamWorker
+        | StorageWriteThreadBatchWorker
+        | StorageWriteProcessBatchWorker
     ]:
         if config.get("options", {}).get("storage_write_batch_mode", False):
             Worker = type("Worker", (StorageWriteBatchWorker, worker_executor_cls), {})
         else:
             Worker = type("Worker", (StorageWriteStreamWorker, worker_executor_cls), {})
-        return cast(Type[StorageWriteThreadStreamWorker], Worker)
+        return cast(type[StorageWriteThreadStreamWorker], Worker)
 
     def __init__(
         self,
         target: "TargetBigQuery",
         stream_name: str,
-        schema: Dict[str, Any],
-        key_properties: Optional[List[str]],
+        schema: dict[str, Any],
+        key_properties: list[str] | None,
     ) -> None:
         super().__init__(target, stream_name, schema, key_properties)
-        self.open_streams: Set[Tuple[str, writer.AppendRowsStream]] = set()
+        self.open_streams: set[tuple[str, writer.AppendRowsStream]] = set()
         self.parent = BigQueryWriteClient.table_path(
             self.table.project,
             self.table.dataset,
@@ -305,14 +301,14 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         self.template = generate_template(self.proto_schema)
 
     @property
-    def proto_schema(self) -> Type[message.Message]:
+    def proto_schema(self) -> type[message.Message]:
         if not hasattr(self, "_proto_schema"):
             self._proto_schema = proto_schema_factory_v2(
                 self.table.get_resolved_schema(self.apply_transforms)
             )
-        return cast(Type[message.Message], self._proto_schema)
+        return cast(type[message.Message], self._proto_schema)
 
-    def start_batch(self, context: Dict[str, Any]) -> None:
+    def start_batch(self, context: dict[str, Any]) -> None:
         self.proto_rows = types.ProtoRows()
 
     def preprocess_record(self, record: dict, context: dict) -> dict:
@@ -320,14 +316,14 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         record["data"] = orjson.dumps(record["data"]).decode("utf-8")
         return record
 
-    def process_record(self, record: Dict[str, Any], context: Dict[str, Any]) -> None:
-        self.proto_rows.serialized_rows.append(  # type: ignore
+    def process_record(self, record: dict[str, Any], context: dict[str, Any]) -> None:
+        self.proto_rows.serialized_rows.append(
             json_format.ParseDict(record, self.proto_schema()).SerializeToString()
         )
 
-    def process_batch(self, context: Dict[str, Any]) -> None:
+    def process_batch(self, context: dict[str, Any]) -> None:
         while self.global_queue.qsize() >= self.MAX_JOBS_QUEUED:
-            self.logger.warn(f"Max jobs enqueued reached ({self.MAX_JOBS_QUEUED})")
+            self.logger.warning(f"Max jobs enqueued reached ({self.MAX_JOBS_QUEUED})")
             sleep(1)
 
         self.global_queue.put(
@@ -348,14 +344,16 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         if not self.open_streams:
             return
         self.open_streams = [
-            (name, stream)
-            for name, stream in self.open_streams
-            if not name.endswith("_default")  # type: ignore
+            (name, stream) for name, stream in self.open_streams if not name.endswith("_default")
         ]
         if self.open_streams:
             committer = storage_client_factory(self._credentials)
             for name, stream in self.open_streams:
-                stream.close()
+                # The worker's close_cached_streams may already have closed this same
+                # stream object (see the mirrored guard there) -- closing again raises
+                # StreamClosedError instead of being a no-op.
+                if not stream._closed:
+                    stream.close()
                 committer.finalize_write_stream(name=name)
             write = committer.batch_commit_write_streams(
                 types.BatchCommitWriteStreamsRequest(
@@ -365,9 +363,7 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
             )
             self.logger.info(f"Batch commit time: {write.commit_time}")
             self.logger.info(f"Batch commit errors: {write.stream_errors}")
-            self.logger.info(
-                f"Writes to streams: '{self.open_streams}' have been committed."
-            )
+            self.logger.info(f"Writes to streams: '{self.open_streams}' have been committed.")
         self.open_streams = set()
 
     def clean_up(self) -> None:
