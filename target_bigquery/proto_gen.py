@@ -10,7 +10,8 @@
 # substantial portions of the Software.
 import hashlib
 import os
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, cast
+from collections.abc import Iterable
+from typing import Any
 
 import proto
 from google.cloud.bigquery import SchemaField
@@ -32,12 +33,10 @@ MAP = {
 }
 
 
-def generate_field_v2(
-    base: SchemaField, i: int = 1, pool: Optional[Any] = None
-) -> Dict[str, Any]:
+def generate_field_v2(base: SchemaField, i: int = 1, pool: Any | None = None) -> dict[str, Any]:
     """Generate proto2 field properties from a SchemaField."""
     name: str = base.name
-    typ: str = cast(str, base.field_type).upper()
+    typ: str = base.field_type.upper()
 
     if base.mode == "REPEATED":
         label = descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED
@@ -46,42 +45,40 @@ def generate_field_v2(
 
     if typ.upper() == "RECORD":
         proto_cls = proto_schema_factory_v2(list(base.fields), pool)
-        props = dict(
-            name=name,
-            number=i,
-            label=label,
-            type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
-            type_name=proto_cls.DESCRIPTOR.full_name,  # type: ignore
-            json_name=name,
-        )
+        props = {
+            "name": name,
+            "number": i,
+            "label": label,
+            "type": descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+            "type_name": proto_cls.DESCRIPTOR.full_name,  # type: ignore
+            "json_name": name,
+        }
     else:
-        props = dict(
-            name=name,
-            number=i,
-            label=label,
-            type=MAP[typ],
-            json_name=name,
-        )
+        props = {
+            "name": name,
+            "number": i,
+            "label": label,
+            "type": MAP[typ],
+            "json_name": name,
+        }
 
     return props
 
 
 def proto_schema_factory_v2(
-    bigquery_schema: List[SchemaField], pool: Optional[Any] = None
-) -> Type[proto.Message]:
+    bigquery_schema: list[SchemaField], pool: Any | None = None
+) -> type[proto.Message]:
     """Generate a proto2 Message from a BigQuery schema."""
     fhash = hashlib.sha1()
     for f in bigquery_schema:
         fhash.update(hash(f).to_bytes(8, "big", signed=True))
     fname = f"AnonymousProto_{fhash.hexdigest()}.proto"
-    clsname = (
-        f"net.proto2.python.public.target_bigquery.AnonymousProto_{fhash.hexdigest()}"
-    )
-    
+    clsname = f"net.proto2.python.public.target_bigquery.AnonymousProto_{fhash.hexdigest()}"
+
     # Use the pool directly if provided, otherwise use the default pool
     if pool is None:
         pool = descriptor_pool.Default()
-    
+
     try:
         proto_descriptor = pool.FindMessageTypeByName(clsname)
         proto_cls = message_factory.GetMessageClass(proto_descriptor)
@@ -99,15 +96,15 @@ def proto_schema_factory_v2(
         pool.Add(file_proto)
         proto_descriptor = pool.FindMessageTypeByName(clsname)
         proto_cls = message_factory.GetMessageClass(proto_descriptor)
-    return proto_cls  # type: ignore
+    return proto_cls
 
 
-def generate_field(base: SchemaField, i: int = 1) -> Tuple[proto.Field, str]:
+def generate_field(base: SchemaField, i: int = 1) -> tuple[proto.Field, str]:
     """Not intended for production use.
     Generate a proto.Field from a SchemaField."""
     kwargs = {}
     name: str = base.name
-    typ: str = cast(str, base.field_type).upper()
+    typ: str = base.field_type.upper()
 
     if base.mode == "REPEATED":
         cls = proto.RepeatedField
@@ -127,16 +124,14 @@ def generate_field(base: SchemaField, i: int = 1) -> Tuple[proto.Field, str]:
     return (f, name)
 
 
-def proto_schema_factory(bigquery_schema: Iterable[SchemaField]) -> Type[proto.Message]:
+def proto_schema_factory(bigquery_schema: Iterable[SchemaField]) -> type[proto.Message]:
     """Not intended for production use.
     Generate a proto.Message from a BigQuery schema."""
     return type(
-        f"Schema{abs(hash((f for f in bigquery_schema)))}",
+        f"Schema{abs(hash(f for f in bigquery_schema))}",
         (proto.Message,),
         {
             name: f
-            for f, name in (
-                generate_field(field, i + 1) for i, field in enumerate(bigquery_schema)
-            )
+            for f, name in (generate_field(field, i + 1) for i, field in enumerate(bigquery_schema))
         },
     )
