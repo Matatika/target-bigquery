@@ -446,13 +446,8 @@ class BaseBigQuerySink(BatchSink):
     def _singer_validate_message(self, record: dict) -> None:
         """Ensure record conforms to Singer Spec.
 
-        Skipped for the FIXED ingestion strategy: preprocess_record intentionally
-        repacks every record into {"data": ..., **_sdc_metadata}, so key properties are
-        no longer top-level keys by design -- the base SDK's key-property-presence
-        check assumes a target that doesn't restructure records, which doesn't hold
-        here. Key properties are only meaningful for merge/upsert, which is
-        DENORMALIZED-only (see _is_upsert_candidate), so nothing downstream depends on
-        this check for FIXED.
+        Skipped for FIXED: preprocess_record repacks records into {"data": ...}, so key
+        properties are never top-level keys there by design.
         """
         if self.ingestion_strategy is IngestionStrategy.FIXED:
             return
@@ -605,11 +600,8 @@ class BaseBigQuerySink(BatchSink):
     ) -> None:
         """Process a BATCH message's manifest files.
 
-        Non-"arrow" encodings fall back to the SDK's default jsonl/parquet handling
-        (unused today, kept as a free fallback). "arrow" encoded batches are ingested
-        directly via ADBC, bypassing preprocess_record/process_record/process_batch and
-        the per-`method` worker/queue plumbing entirely -- see core.py's module docstring
-        decision notes / MEL-649 for why.
+        Non-"arrow" encodings fall back to the SDK's default handling. "arrow" batches
+        are ingested directly via ADBC, bypassing process_record/process_batch entirely.
         """
         if encoding.format != "arrow":
             super().process_batch_files(encoding, files)
@@ -649,11 +641,8 @@ def _conform_denormalized(
 ) -> pa.Table:
     """Conform an Arrow table's columns to an already-resolved BigQuery schema.
 
-    Renames columns via the same `transform_column_name` used elsewhere in this module,
-    drops columns the schema doesn't know about, and replaces any column whose resolved
-    BigQuery type is JSON with an orjson-encoded string column (everything else passes
-    through as-is -- BigQuery's Arrow ingest already maps struct->RECORD, list->ARRAY,
-    scalars 1:1). This conforms *to* an already-resolved schema; it never infers one.
+    Renames columns, drops unknown ones, and JSON-encodes any column whose resolved
+    type is JSON. Conforms *to* an already-resolved schema; never infers one.
     """
     json_fields = {f.name for f in resolved_schema if f.field_type.upper() == "JSON"}
     known_fields = {f.name for f in resolved_schema}
@@ -935,9 +924,7 @@ class SchemaTranslator:
                         return SchemaField(name, "JSON", "NULLABLE")
                     result_type = bigquery_type(property_type, property_format)
                     return SchemaField(name, result_type, "NULLABLE")
-            except Exception:  # noqa: BLE001 -- V2 resolver's contract is: fall back to
-                # JSON on *any* resolution failure rather than raise, so callers never
-                # need to special-case an unresolvable property.
+            except Exception:  # noqa: BLE001 -- fall back to JSON on any resolution failure
                 return SchemaField(name, "JSON", "NULLABLE")
         else:
             raise ValueError(f"Invalid resolver version: {self.resolver_version}")
@@ -1072,8 +1059,7 @@ class Compressor:
         self._compressor = None
         self._closed = False
         if shutil.which("gzip") is not None:
-            self._buffer = TemporaryFile()  # noqa: SIM115 -- lives for the Compressor's
-            # whole lifetime (write/close/__del__ all use it), not scoped to __init__.
+            self._buffer = TemporaryFile()  # noqa: SIM115 -- lives past __init__
             self._compressor = Popen(["gzip", "-"], stdin=PIPE, stdout=self._buffer)
             if self._compressor.stdin is None:
                 raise RuntimeError("gzip stdin is None")

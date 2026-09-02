@@ -14,6 +14,9 @@ StandardTargetTests = get_target_test_class(
         "project": os.environ["BQ_PROJECT"],
         "dataset": os.environ["BQ_DATASET"],
     },
+    # Default True re-reads .env on every Target construction, clobbering the
+    # per-session BQ_DATASET override in conftest.py.
+    parse_env_config=False,
 )
 
 
@@ -21,13 +24,8 @@ class TestTargetBigQuery(StandardTargetTests):
     """Standard Target Tests."""
 
     @pytest.mark.skip(
-        reason=(
-            "The default (FIXED) ingestion strategy intentionally repacks every "
-            "record into an opaque `data` JSON blob, so key-property presence in the "
-            "raw record is never meaningful or enforced -- see "
-            "BaseBigQuerySink._singer_validate_message. This standard test assumes "
-            "targets don't restructure records, which doesn't hold for FIXED."
-        )
+        reason="FIXED strategy repacks records into an opaque `data` blob, so key "
+        "properties are never top-level keys -- see BaseBigQuerySink._singer_validate_message"
     )
     def test_target_record_missing_key_property(self, *args, **kwargs):
         pass

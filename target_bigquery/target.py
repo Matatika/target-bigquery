@@ -68,14 +68,8 @@ WORKER_CREATION_MIN_INTERVAL = 5
 
 
 class OrjsonSingerReader(SingerReader):
-    """Message reader that uses orjson for line parsing.
-
-    The SDK's default message reader (singer_sdk.singerlib.json.deserialize_json) parses
-    JSON numbers with parse_float=decimal.Decimal, to preserve precision. orjson doesn't
-    support serializing decimal.Decimal back out (used throughout this target to write
-    records to BigQuery), so parse with orjson instead -- which always produces native
-    float -- avoiding that mismatch entirely.
-    """
+    """Parses lines with orjson (native float) instead of the SDK default, which parses
+    JSON numbers as decimal.Decimal -- a type orjson can't serialize back out."""
 
     def deserialize_json(self, line: str) -> dict:
         return orjson.loads(line)
@@ -568,9 +562,7 @@ class TargetBigQuery(Target):
                     # greater than the downside for now but will revisit this.
                     self.logger.error("Draining all sinks and terminating.")
                     self.drain_all(is_endofpipe=True)
-                except Exception:  # noqa: BLE001 -- best-effort drain before the
-                    # RuntimeError below is raised regardless; any failure here shouldn't
-                    # mask the original error.
+                except Exception:  # noqa: BLE001 -- best-effort, error raised below anyway
                     self.logger.error("Drain failed.")
                 raise RuntimeError(msg) from e
             else:

@@ -144,10 +144,8 @@ class BigQueryGcsStagingSink(BaseBigQuerySink):
             self.config["project"],
         )
         self.client = gcs_client_factory(self._credentials)
-        # Deferred to first process_record rather than created here: a stream that only
-        # ever receives Arrow BATCH data (which bypasses process_record/GCS entirely --
-        # see BaseBigQuerySink.process_batch_files) should never provision a bucket it'll
-        # never use.
+        # Bucket creation is deferred to first process_record (below) so an Arrow-only
+        # stream, which bypasses GCS entirely, never provisions a bucket it won't use.
         self.buffer = Compressor()
         self.gcs_notification, self.gcs_notifier = target.pipe_cls(False)
         self.uris: list[str] = []
@@ -170,10 +168,7 @@ class BigQueryGcsStagingSink(BaseBigQuerySink):
 
     def process_record(self, record: dict[str, Any], context: dict[str, Any]) -> None:
         if not hasattr(self, "_gcs_bucket"):
-            # create_bucket_if_not_exists() sleeps on every call *after* the first (to
-            # wait for eventual consistency), so it must only ever be invoked once --
-            # this hasattr guard is that "only once", not create_bucket_if_not_exists's
-            # own internal one.
+            # Guard: create_bucket_if_not_exists sleeps on every call after the first.
             self.create_bucket_if_not_exists()
         self.buffer.write(orjson.dumps(record, option=orjson.OPT_APPEND_NEWLINE))
 

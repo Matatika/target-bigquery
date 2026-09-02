@@ -15,7 +15,9 @@ on:
     inputs: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  # github.head_ref is empty on push events; fall back to github.ref, not
+  # github.run_id, so concurrent pushes to the same branch actually cancel each other.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:

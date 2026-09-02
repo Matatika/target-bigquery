@@ -2246,7 +2246,6 @@ wheels = [
 
 [[package]]
 name = "z3-target-bigquery"
-version = "0.7.2"
 source = { editable = "." }
 dependencies = [
     { name = "adbc-driver-manager" },

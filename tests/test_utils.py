@@ -734,9 +734,7 @@ def test_jit_compile_proto():
 
 
 class _DummySink:
-    """Minimal stand-in for BaseBigQuerySink -- just enough attributes for
-    process_batch_files's FIXED-strategy fail-fast check, which runs before touching
-    anything else on self (no live BigQuery connection needed)."""
+    """Just enough of a BaseBigQuerySink for the FIXED-strategy fail-fast check."""
 
     def __init__(self, ingestion_strategy):
         self.ingestion_strategy = ingestion_strategy

@@ -218,14 +218,11 @@ class StorageWriteBatchWorker(BaseWorker):
         """Close all cached streams."""
         for _, stream, _ in self.cache.values():
             if stream._closed:
-                # Already closed by the sink's commit_streams (they share the same
-                # AppendRowsStream object via stream_notifier) -- closing again raises
-                # StreamClosedError instead of being a no-op.
+                # Already closed by the sink's commit_streams (same stream object).
                 continue
             try:
                 stream.close()
-            except Exception as exc:  # noqa: BLE001 -- worker loop: route any failure
-                # to error_notifier instead of crashing the worker process/thread.
+            except Exception as exc:  # noqa: BLE001 -- route to error_notifier
                 self.error_notifier.send((exc, self.serialize_exception(exc)))
 
     def wait(self, drain: bool = False) -> None:
@@ -233,8 +230,7 @@ class StorageWriteBatchWorker(BaseWorker):
         while self.awaiting and ((len(self.awaiting) > MAX_IN_FLIGHT // 2) or drain):
             try:
                 self.awaiting.pop(0).result()
-            except Exception as exc:  # noqa: BLE001 -- worker loop: route any failure
-                # to error_notifier instead of crashing the worker process/thread.
+            except Exception as exc:  # noqa: BLE001 -- route to error_notifier
                 self.error_notifier.send((exc, self.serialize_exception(exc)))
             finally:
                 self.job_notifier.send(True)
@@ -349,9 +345,7 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         if self.open_streams:
             committer = storage_client_factory(self._credentials)
             for name, stream in self.open_streams:
-                # The worker's close_cached_streams may already have closed this same
-                # stream object (see the mirrored guard there) -- closing again raises
-                # StreamClosedError instead of being a no-op.
+                # May already be closed by the worker's close_cached_streams.
                 if not stream._closed:
                     stream.close()
                 committer.finalize_write_stream(name=name)

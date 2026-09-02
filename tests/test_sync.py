@@ -206,9 +206,7 @@ def test_basic_denorm_sync(method):
     ids=["batch_job", "streaming_insert", "gcs_stage", "storage_write_api"],
 )
 def test_arrow_batch_sync(method, tmp_path):
-    """Arrow BATCH ingestion (encoding.format=="arrow") is method-independent and only
-    supported for the denormalized ingestion strategy -- see MEL-649 / core.py's
-    process_batch_files override."""
+    """Arrow BATCH ingestion is method-independent and denormalized-only."""
     OPTS = {
         "method": method,
         "denormalized": True,
@@ -261,11 +259,7 @@ def test_arrow_batch_sync(method, tmp_path):
             "credentials_json": os.environ["BQ_CREDS"],
             "project": os.environ["BQ_PROJECT"],
             "dataset": os.environ["BQ_DATASET"],
-            # A bogus bucket name that's never actually created/used: Arrow BATCH
-            # ingestion bypasses gcs_stage's bucket entirely, and bucket creation is
-            # lazy (deferred to the first RECORD-based process_record call, which never
-            # happens in this test) -- this is exactly what proves that laziness for
-            # method=gcs_stage.
+            # Never created/used: proves gcs_stage's lazy bucket creation for Arrow BATCH.
             "bucket": "unused-bucket-arrow-batch-test",
             **OPTS,
         },
@@ -288,9 +282,7 @@ def test_arrow_batch_sync(method, tmp_path):
 
 
 def test_arrow_batch_fixed_strategy_fails_fast(tmp_path):
-    """The FIXED (denormalized=False, the default) strategy can't be bulk-loaded
-    columnarly and must fail fast rather than silently falling back to per-record
-    processing -- see MEL-649."""
+    """FIXED strategy can't be bulk-loaded columnarly and must fail fast."""
     table_name = "fixed_arrow_batch_incompatible"
 
     arrow_table = pa.table({"id": pa.array([0], type=pa.int64())})
