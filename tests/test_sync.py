@@ -249,7 +249,12 @@ def test_arrow_batch_sync(method, tmp_path):
             "credentials_json": os.environ["BQ_CREDS"],
             "project": os.environ["BQ_PROJECT"],
             "dataset": os.environ["BQ_DATASET"],
-            "bucket": os.environ["GCS_BUCKET"],
+            # A bogus bucket name that's never actually created/used: Arrow BATCH
+            # ingestion bypasses gcs_stage's bucket entirely, and bucket creation is
+            # lazy (deferred to the first RECORD-based process_record call, which never
+            # happens in this test) -- this is exactly what proves that laziness for
+            # method=gcs_stage.
+            "bucket": "unused-bucket-arrow-batch-test",
             **OPTS,
         },
     )
