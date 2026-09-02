@@ -13,6 +13,8 @@ from singer_sdk.testing import target_sync_test
 from target_bigquery.core import BigQueryCredentials, bigquery_client_factory
 from target_bigquery.target import TargetBigQuery
 
+GCS_STAGE_XFAIL = pytest.mark.xfail(reason="GCS is misconfigured")
+
 # id = (0-4) - normal case
 # id = 5 - datetime NULL case
 # id = 6 - datetime wrong format case
@@ -53,7 +55,12 @@ SECONDARY_SINGER_STREAM = """
 
 @pytest.mark.parametrize(
     "method",
-    ["batch_job", "streaming_insert", "storage_write_api", "gcs_stage"],
+    [
+        "batch_job",
+        "streaming_insert",
+        "storage_write_api",
+        pytest.param("gcs_stage", marks=GCS_STAGE_XFAIL),
+    ],
     ids=["batch_job", "streaming_insert", "storage_write_api", "gcs_stage"],
 )
 @pytest.mark.parametrize("batch_mode", [False, True], ids=["no_batch_mode", "batch_mode"])
@@ -132,7 +139,12 @@ def test_basic_sync(method, batch_mode):
 
 @pytest.mark.parametrize(
     "method",
-    ["batch_job", "streaming_insert", "gcs_stage", "storage_write_api"],
+    [
+        "batch_job",
+        "streaming_insert",
+        pytest.param("gcs_stage", marks=GCS_STAGE_XFAIL),
+        "storage_write_api",
+    ],
     ids=["batch_job", "streaming_insert", "gcs_stage", "storage_write_api"],
 )
 def test_basic_denorm_sync(method):
