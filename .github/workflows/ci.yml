@@ -31,13 +31,9 @@ jobs:
       matrix:
         py_version:
           - "3.10"
-          - "3.11"
-          - "3.12"
-          - "3.13"
           - "3.14"
     runs-on: ubuntu-latest
     env:
-      PYTHON_VERSION: ${{ matrix.py_version }}
       BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
       BQ_DATASET: ${{ secrets.BQ_DATASET }}
       BQ_CREDS: ${{ secrets.BQ_CREDS }}
