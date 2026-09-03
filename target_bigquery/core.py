@@ -634,19 +634,36 @@ class BaseBigQuerySink(BatchSink):
             self.tally_record_written(total_written)
 
 
-def _widen_narrow_decimals(column: pa.Array) -> pa.Array:
-    """Cast decimal32/decimal64 columns up to decimal128.
+def _conform_decimal_column(column: pa.Array, resolved_type: str) -> pa.Array:
+    """Conform a decimal32/decimal64/decimal128/decimal256 column to `resolved_type`.
 
-    BigQuery's ADBC driver only supports ingesting decimal128/decimal256 Arrow arrays --
-    a decimal32 or decimal64 column (e.g. what the MySQL ADBC driver emits for a narrow
-    DECIMAL/NUMERIC column) fails with "not implemented: support for DECIMAL64" at
-    adbc_ingest() time otherwise. decimal128 covers every value either narrower type can
-    hold (max precision 38 vs. 18 for decimal64, 9 for decimal32), so this is always a
-    safe, lossless widening, never a truncation.
+    create_target() creates the physical BigQuery table from the Singer jsonschema
+    (bigquery_type() maps a plain "number" property to FLOAT, with no awareness of
+    decimal precision) before any BATCH data is ever processed -- so the destination
+    column's type is already fixed by the time a BATCH file arrives here, and BigQuery's
+    own load-job schema validation rejects a mismatch against it outright. This must
+    therefore conform *to* that already-created column type, not to whatever's most
+    natural for the source data:
+
+    - NUMERIC/BIGNUMERIC: BigQuery's ADBC driver only supports ingesting
+      decimal128/decimal256 Arrow arrays -- a decimal32 or decimal64 column (e.g. what
+      the MySQL ADBC driver emits for a narrow DECIMAL/NUMERIC column) fails with "not
+      implemented: support for DECIMAL64" at adbc_ingest() time otherwise. decimal128
+      covers every value either narrower type can hold (max precision 38 vs. 18 for
+      decimal64, 9 for decimal32), so widening is always safe, never a truncation.
+    - Anything else (in practice always FLOAT, per bigquery_type() today): downcast to
+      float64 to match, at the cost of the same precision/rounding behavior a plain
+      "number"-typed property already has for every other target-bigquery ingestion
+      path (RECORD messages, gcs_stage, etc.) -- BATCH must behave the same way here,
+      not silently gain more precision than the column it's writing into can express.
     """
-    if pa.types.is_decimal32(column.type) or pa.types.is_decimal64(column.type):
-        return column.cast(pa.decimal128(column.type.precision, column.type.scale))
-    return column
+    if not (pa.types.is_decimal(column.type)):
+        return column
+    if resolved_type in ("NUMERIC", "BIGNUMERIC"):
+        if pa.types.is_decimal32(column.type) or pa.types.is_decimal64(column.type):
+            return column.cast(pa.decimal128(column.type.precision, column.type.scale))
+        return column
+    return column.cast(pa.float64())
 
 
 def _conform_denormalized(
@@ -657,17 +674,17 @@ def _conform_denormalized(
     """Conform an Arrow table's columns to an already-resolved BigQuery schema.
 
     Renames columns, drops unknown ones, JSON-encodes any column whose resolved type is
-    JSON, and widens decimal32/decimal64 columns to decimal128 (see
-    _widen_narrow_decimals). Conforms *to* an already-resolved schema; never infers one.
+    JSON, and conforms any decimal column to the resolved type (see
+    _conform_decimal_column). Conforms *to* an already-resolved schema; never infers one.
     """
     json_fields = {f.name for f in resolved_schema if f.field_type.upper() == "JSON"}
-    known_fields = {f.name for f in resolved_schema}
+    resolved_types = {f.name: f.field_type.upper() for f in resolved_schema}
 
     names: list[str] = []
     columns: list[pa.Array] = []
     for name in table.column_names:
         conformed_name = transform_column_name(name, **transforms)
-        if conformed_name not in known_fields:
+        if conformed_name not in resolved_types:
             continue
         column = table.column(name)
         if conformed_name in json_fields:
@@ -679,7 +696,7 @@ def _conform_denormalized(
                 type=pa.string(),
             )
         else:
-            column = _widen_narrow_decimals(column)
+            column = _conform_decimal_column(column, resolved_types[conformed_name])
         names.append(conformed_name)
         columns.append(column)
 

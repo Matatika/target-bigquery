@@ -12,8 +12,8 @@ from target_bigquery.core import (
     BigQueryTable,
     IngestionStrategy,
     SchemaTranslator,
+    _conform_decimal_column,
     _conform_denormalized,
-    _widen_narrow_decimals,
     bigquery_type,
     transform_column_name,
 )
@@ -771,25 +771,46 @@ def test_conform_denormalized_renames_drops_and_json_encodes():
 
 
 @pytest.mark.parametrize("narrow_type", [pa.decimal32(5, 2), pa.decimal64(10, 2)])
-def test_widen_narrow_decimals_casts_to_decimal128(narrow_type):
+def test_conform_decimal_column_widens_to_decimal128_for_a_numeric_column(narrow_type):
     column = pa.chunked_array([pa.array([Decimal("123.45"), None], type=narrow_type)])
 
-    widened = _widen_narrow_decimals(column)
+    conformed = _conform_decimal_column(column, "NUMERIC")
 
-    assert widened.type == pa.decimal128(narrow_type.precision, narrow_type.scale)
-    assert widened.to_pylist() == column.to_pylist()
+    assert conformed.type == pa.decimal128(narrow_type.precision, narrow_type.scale)
+    assert conformed.to_pylist() == column.to_pylist()
 
 
-def test_widen_narrow_decimals_leaves_other_types_alone():
+def test_conform_decimal_column_leaves_decimal128_alone_for_a_numeric_column():
+    column = pa.chunked_array([pa.array([Decimal("123.45"), None], type=pa.decimal128(10, 2))])
+
+    assert _conform_decimal_column(column, "NUMERIC") is column
+
+
+def test_conform_decimal_column_downcasts_to_float64_for_a_float_column():
+    """create_target() creates the physical table from the Singer jsonschema before any
+    BATCH data is processed, and bigquery_type() maps a plain "number" property to
+    FLOAT -- so a decimal column arriving via Arrow BATCH (e.g. a MySQL DECIMAL column,
+    extracted as decimal64) must downcast to match that already-created FLOAT column,
+    not widen past what it can express."""
+    column = pa.chunked_array([pa.array([Decimal("123.45"), None], type=pa.decimal64(10, 2))])
+
+    conformed = _conform_decimal_column(column, "FLOAT")
+
+    assert conformed.type == pa.float64()
+    assert conformed.to_pylist() == [123.45, None]
+
+
+def test_conform_decimal_column_leaves_non_decimal_types_alone():
     column = pa.chunked_array([pa.array([1, 2])])
 
-    assert _widen_narrow_decimals(column) is column
+    assert _conform_decimal_column(column, "FLOAT") is column
 
 
-def test_conform_denormalized_widens_decimal64_column_for_bigquery_adbc_ingest():
+def test_conform_denormalized_widens_decimal64_column_for_a_numeric_destination():
     """BigQuery's ADBC driver rejects decimal64 outright ("not implemented: support for
     DECIMAL64") -- a MySQL DECIMAL column extracted via ADBC arrives as exactly that, so
-    _conform_denormalized must widen it before adbc_ingest() ever sees it."""
+    _conform_denormalized must widen it before adbc_ingest() ever sees it, when the
+    resolved destination column is itself NUMERIC/BIGNUMERIC."""
     resolved_schema = [SchemaField("balance", "NUMERIC")]
     table = pa.table({"balance": pa.array([Decimal("123.45"), None], type=pa.decimal64(10, 2))})
 
@@ -797,3 +818,17 @@ def test_conform_denormalized_widens_decimal64_column_for_bigquery_adbc_ingest()
 
     assert conformed.column("balance").type == pa.decimal128(10, 2)
     assert conformed.column("balance").to_pylist() == table.column("balance").to_pylist()
+
+
+def test_conform_denormalized_downcasts_decimal64_column_for_a_float_destination():
+    """The common case in practice: bigquery_type() maps a plain "number" property (no
+    decimal-precision hint in the Singer schema) to FLOAT, so a decimal64 column must
+    downcast to float64 to match the table create_target() already created -- BigQuery's
+    own load-job schema validation otherwise rejects the mismatch outright."""
+    resolved_schema = [SchemaField("balance", "FLOAT")]
+    table = pa.table({"balance": pa.array([Decimal("123.45"), None], type=pa.decimal64(10, 2))})
+
+    conformed = _conform_denormalized(table, resolved_schema, {})
+
+    assert conformed.column("balance").type == pa.float64()
+    assert conformed.column("balance").to_pylist() == [123.45, None]
