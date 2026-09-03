@@ -14,6 +14,7 @@ from target_bigquery.core import (
     SchemaTranslator,
     _conform_decimal_column,
     _conform_denormalized,
+    _is_postgres_opaque_numeric,
     bigquery_type,
     transform_column_name,
 )
@@ -827,6 +828,65 @@ def test_conform_denormalized_downcasts_decimal64_column_for_a_float_destination
     own load-job schema validation otherwise rejects the mismatch outright."""
     resolved_schema = [SchemaField("balance", "FLOAT")]
     table = pa.table({"balance": pa.array([Decimal("123.45"), None], type=pa.decimal64(10, 2))})
+
+    conformed = _conform_denormalized(table, resolved_schema, {})
+
+    assert conformed.column("balance").type == pa.float64()
+    assert conformed.column("balance").to_pylist() == [123.45, None]
+
+
+def _postgres_opaque_numeric_column(values: list[str | None]) -> pa.ChunkedArray:
+    opaque_type = pa.opaque(pa.string(), "numeric", "PostgreSQL")
+    return pa.chunked_array([pa.array(values, type=pa.string()).cast(opaque_type)])
+
+
+def test_is_postgres_opaque_numeric_true_for_the_postgres_adbc_driver_numeric_type():
+    assert _is_postgres_opaque_numeric(pa.opaque(pa.string(), "numeric", "PostgreSQL"))
+
+
+@pytest.mark.parametrize(
+    "arrow_type",
+    [
+        pa.string(),
+        pa.decimal128(10, 2),
+        pa.opaque(pa.string(), "numeric", "SomeOtherVendor"),
+        pa.opaque(pa.string(), "uuid", "PostgreSQL"),
+    ],
+)
+def test_is_postgres_opaque_numeric_false_for_anything_else(arrow_type):
+    assert not _is_postgres_opaque_numeric(arrow_type)
+
+
+def test_conform_decimal_column_casts_postgres_opaque_numeric_to_decimal128_for_a_numeric_column():
+    """adbc-driver-postgresql never maps NUMERIC to a native Arrow decimal type -- even a
+    precision-bounded column like NUMERIC(12,2) comes back as an opaque extension type
+    whose storage is Postgres's own textual representation (e.g. "123.45"), which
+    pa.types.is_decimal() doesn't recognize at all."""
+    column = _postgres_opaque_numeric_column(["123.45", None])
+
+    conformed = _conform_decimal_column(column, "NUMERIC")
+
+    assert conformed.type == pa.decimal128(38, 9)
+    assert conformed.to_pylist() == [Decimal("123.450000000"), None]
+
+
+def test_conform_decimal_column_casts_postgres_opaque_numeric_to_float64_for_a_float_column():
+    column = _postgres_opaque_numeric_column(["123.45", None])
+
+    conformed = _conform_decimal_column(column, "FLOAT")
+
+    assert conformed.type == pa.float64()
+    assert conformed.to_pylist() == [123.45, None]
+
+
+def test_conform_denormalized_casts_postgres_opaque_numeric_column_for_a_float_destination():
+    """The failure this reproduces: tap-postgres's Arrow BATCH mode extracts a
+    NUMERIC(12,2) column as adbc-driver-postgresql's opaque-numeric extension type, which
+    BigQuery's ADBC driver then infers as STRING at ingest time -- conflicting with the
+    FLOAT column bigquery_type() already created for the same "number" property, with
+    "Field balance has changed type from FLOAT to STRING"."""
+    resolved_schema = [SchemaField("balance", "FLOAT")]
+    table = pa.table({"balance": _postgres_opaque_numeric_column(["123.45", None])})
 
     conformed = _conform_denormalized(table, resolved_schema, {})
 
