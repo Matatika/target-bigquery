@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import pyarrow as pa
 import pytest
 import singer_sdk.typing as th
@@ -11,6 +13,7 @@ from target_bigquery.core import (
     IngestionStrategy,
     SchemaTranslator,
     _conform_denormalized,
+    _widen_narrow_decimals,
     bigquery_type,
     transform_column_name,
 )
@@ -765,3 +768,32 @@ def test_conform_denormalized_renames_drops_and_json_encodes():
     assert set(conformed.column_names) == {"id", "full_name", "metadata"}
     assert conformed.column("metadata").to_pylist() == ['{"a":1}', None]
     assert conformed.column("full_name").to_pylist() == ["Ada", "Grace"]
+
+
+@pytest.mark.parametrize("narrow_type", [pa.decimal32(5, 2), pa.decimal64(10, 2)])
+def test_widen_narrow_decimals_casts_to_decimal128(narrow_type):
+    column = pa.chunked_array([pa.array([Decimal("123.45"), None], type=narrow_type)])
+
+    widened = _widen_narrow_decimals(column)
+
+    assert widened.type == pa.decimal128(narrow_type.precision, narrow_type.scale)
+    assert widened.to_pylist() == column.to_pylist()
+
+
+def test_widen_narrow_decimals_leaves_other_types_alone():
+    column = pa.chunked_array([pa.array([1, 2])])
+
+    assert _widen_narrow_decimals(column) is column
+
+
+def test_conform_denormalized_widens_decimal64_column_for_bigquery_adbc_ingest():
+    """BigQuery's ADBC driver rejects decimal64 outright ("not implemented: support for
+    DECIMAL64") -- a MySQL DECIMAL column extracted via ADBC arrives as exactly that, so
+    _conform_denormalized must widen it before adbc_ingest() ever sees it."""
+    resolved_schema = [SchemaField("balance", "NUMERIC")]
+    table = pa.table({"balance": pa.array([Decimal("123.45"), None], type=pa.decimal64(10, 2))})
+
+    conformed = _conform_denormalized(table, resolved_schema, {})
+
+    assert conformed.column("balance").type == pa.decimal128(10, 2)
+    assert conformed.column("balance").to_pylist() == table.column("balance").to_pylist()
