@@ -634,6 +634,21 @@ class BaseBigQuerySink(BatchSink):
             self.tally_record_written(total_written)
 
 
+def _widen_narrow_decimals(column: pa.Array) -> pa.Array:
+    """Cast decimal32/decimal64 columns up to decimal128.
+
+    BigQuery's ADBC driver only supports ingesting decimal128/decimal256 Arrow arrays --
+    a decimal32 or decimal64 column (e.g. what the MySQL ADBC driver emits for a narrow
+    DECIMAL/NUMERIC column) fails with "not implemented: support for DECIMAL64" at
+    adbc_ingest() time otherwise. decimal128 covers every value either narrower type can
+    hold (max precision 38 vs. 18 for decimal64, 9 for decimal32), so this is always a
+    safe, lossless widening, never a truncation.
+    """
+    if pa.types.is_decimal32(column.type) or pa.types.is_decimal64(column.type):
+        return column.cast(pa.decimal128(column.type.precision, column.type.scale))
+    return column
+
+
 def _conform_denormalized(
     table: pa.Table,
     resolved_schema: list[SchemaField],
@@ -641,8 +656,9 @@ def _conform_denormalized(
 ) -> pa.Table:
     """Conform an Arrow table's columns to an already-resolved BigQuery schema.
 
-    Renames columns, drops unknown ones, and JSON-encodes any column whose resolved
-    type is JSON. Conforms *to* an already-resolved schema; never infers one.
+    Renames columns, drops unknown ones, JSON-encodes any column whose resolved type is
+    JSON, and widens decimal32/decimal64 columns to decimal128 (see
+    _widen_narrow_decimals). Conforms *to* an already-resolved schema; never infers one.
     """
     json_fields = {f.name for f in resolved_schema if f.field_type.upper() == "JSON"}
     known_fields = {f.name for f in resolved_schema}
@@ -662,6 +678,8 @@ def _conform_denormalized(
                 ],
                 type=pa.string(),
             )
+        else:
+            column = _widen_narrow_decimals(column)
         names.append(conformed_name)
         columns.append(column)
 
