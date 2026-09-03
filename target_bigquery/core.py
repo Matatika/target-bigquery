@@ -634,8 +634,32 @@ class BaseBigQuerySink(BatchSink):
             self.tally_record_written(total_written)
 
 
+def _is_postgres_opaque_numeric(arrow_type: pa.DataType) -> bool:
+    """Whether `arrow_type` is adbc-driver-postgresql's own representation for NUMERIC.
+
+    The official Postgres ADBC driver never maps NUMERIC to a native Arrow decimal type
+    at all -- an unbounded/unconstrained precision doesn't fit any fixed-width
+    decimal128/256, so even a precision-bounded column (e.g. NUMERIC(12,2)) comes back
+    as an `arrow.opaque` extension type whose storage is a plain string holding
+    Postgres's own textual representation (e.g. "123.45"), tagged
+    type_name="numeric"/vendor_name="PostgreSQL". pa.types.is_decimal() doesn't
+    recognize this at all -- it needs its own check before _conform_decimal_column can
+    do anything with it.
+    """
+    return (
+        isinstance(arrow_type, pa.OpaqueType)
+        and arrow_type.type_name == "numeric"
+        and arrow_type.vendor_name == "PostgreSQL"
+    )
+
+
 def _conform_decimal_column(column: pa.Array, resolved_type: str) -> pa.Array:
-    """Conform a decimal32/decimal64/decimal128/decimal256 column to `resolved_type`.
+    """Conform a decimal-valued column to `resolved_type`.
+
+    Handles both native Arrow decimal32/64/128/256 columns (e.g. what the MySQL ADBC
+    driver emits for a DECIMAL column) and adbc-driver-postgresql's opaque-numeric
+    extension columns (see _is_postgres_opaque_numeric) -- both need conforming, just
+    via different source representations.
 
     create_target() creates the physical BigQuery table from the Singer jsonschema
     (bigquery_type() maps a plain "number" property to FLOAT, with no awareness of
@@ -646,18 +670,25 @@ def _conform_decimal_column(column: pa.Array, resolved_type: str) -> pa.Array:
     natural for the source data:
 
     - NUMERIC/BIGNUMERIC: BigQuery's ADBC driver only supports ingesting
-      decimal128/decimal256 Arrow arrays -- a decimal32 or decimal64 column (e.g. what
-      the MySQL ADBC driver emits for a narrow DECIMAL/NUMERIC column) fails with "not
-      implemented: support for DECIMAL64" at adbc_ingest() time otherwise. decimal128
-      covers every value either narrower type can hold (max precision 38 vs. 18 for
-      decimal64, 9 for decimal32), so widening is always safe, never a truncation.
-    - Anything else (in practice always FLOAT, per bigquery_type() today): downcast to
+      decimal128/decimal256 Arrow arrays -- a decimal32 or decimal64 column fails with
+      "not implemented: support for DECIMAL64" at adbc_ingest() time otherwise, and an
+      opaque-numeric column isn't a decimal type at all as far as the driver's
+      concerned. Both get cast to decimal128: widening a decimal32/64 column always
+      covers every value it could hold (max precision 38 vs. 18/9), and decimal128(38,
+      9) matches BigQuery's own default NUMERIC precision/scale, which is the best
+      guess available since the opaque type carries none of its own.
+    - Anything else (in practice always FLOAT, per bigquery_type() today): cast to
       float64 to match, at the cost of the same precision/rounding behavior a plain
       "number"-typed property already has for every other target-bigquery ingestion
       path (RECORD messages, gcs_stage, etc.) -- BATCH must behave the same way here,
       not silently gain more precision than the column it's writing into can express.
     """
-    if not (pa.types.is_decimal(column.type)):
+    if _is_postgres_opaque_numeric(column.type):
+        target = (
+            pa.decimal128(38, 9) if resolved_type in ("NUMERIC", "BIGNUMERIC") else pa.float64()
+        )
+        return column.cast(target)
+    if not pa.types.is_decimal(column.type):
         return column
     if resolved_type in ("NUMERIC", "BIGNUMERIC"):
         if pa.types.is_decimal32(column.type) or pa.types.is_decimal64(column.type):
