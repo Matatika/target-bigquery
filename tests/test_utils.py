@@ -12,9 +12,8 @@ from target_bigquery.core import (
     BigQueryTable,
     IngestionStrategy,
     SchemaTranslator,
-    _conform_decimal_column,
     _conform_denormalized,
-    _is_postgres_opaque_numeric,
+    _conform_scalar_column,
     bigquery_type,
     transform_column_name,
 )
@@ -772,22 +771,26 @@ def test_conform_denormalized_renames_drops_and_json_encodes():
 
 
 @pytest.mark.parametrize("narrow_type", [pa.decimal32(5, 2), pa.decimal64(10, 2)])
-def test_conform_decimal_column_widens_to_decimal128_for_a_numeric_column(narrow_type):
+def test_conform_scalar_column_widens_decimal_to_decimal128_for_a_numeric_column(narrow_type):
+    """BigQuery's ADBC driver rejects decimal32/decimal64 outright ("not implemented:
+    support for DECIMAL64") -- a MySQL DECIMAL column extracted via ADBC arrives as
+    exactly that, so it must widen to decimal128(38, 9) (the Arrow type the driver
+    requires for NUMERIC) before adbc_ingest() ever sees it."""
     column = pa.chunked_array([pa.array([Decimal("123.45"), None], type=narrow_type)])
 
-    conformed = _conform_decimal_column(column, "NUMERIC")
+    conformed = _conform_scalar_column(column, "NUMERIC")
 
-    assert conformed.type == pa.decimal128(narrow_type.precision, narrow_type.scale)
-    assert conformed.to_pylist() == column.to_pylist()
-
-
-def test_conform_decimal_column_leaves_decimal128_alone_for_a_numeric_column():
-    column = pa.chunked_array([pa.array([Decimal("123.45"), None], type=pa.decimal128(10, 2))])
-
-    assert _conform_decimal_column(column, "NUMERIC") is column
+    assert conformed.type == pa.decimal128(38, 9)
+    assert conformed.to_pylist() == [Decimal("123.450000000"), None]
 
 
-def test_conform_decimal_column_downcasts_to_float64_for_a_float_column():
+def test_conform_scalar_column_leaves_a_column_alone_when_its_type_already_matches():
+    column = pa.chunked_array([pa.array([Decimal("123.45"), None], type=pa.decimal128(38, 9))])
+
+    assert _conform_scalar_column(column, "NUMERIC") is column
+
+
+def test_conform_scalar_column_downcasts_decimal_to_float64_for_a_float_column():
     """create_target() creates the physical table from the Singer jsonschema before any
     BATCH data is processed, and bigquery_type() maps a plain "number" property to
     FLOAT -- so a decimal column arriving via Arrow BATCH (e.g. a MySQL DECIMAL column,
@@ -795,46 +798,62 @@ def test_conform_decimal_column_downcasts_to_float64_for_a_float_column():
     not widen past what it can express."""
     column = pa.chunked_array([pa.array([Decimal("123.45"), None], type=pa.decimal64(10, 2))])
 
-    conformed = _conform_decimal_column(column, "FLOAT")
+    conformed = _conform_scalar_column(column, "FLOAT")
 
     assert conformed.type == pa.float64()
     assert conformed.to_pylist() == [123.45, None]
 
 
-def test_conform_decimal_column_leaves_non_numeric_types_alone():
+def test_conform_scalar_column_casts_decimal_to_int64_for_an_integer_column():
+    """The latent bug this generalization fixes for free: a decimal source column
+    (e.g. a scale-0 DECIMAL extracted as a native decimal type, rather than an integer
+    one) arriving for an INTEGER-resolved destination previously got unconditionally
+    downcast to float64 instead of int64, which BigQuery's schema validation would
+    reject just as readily as the original FLOAT/INTEGER mismatch."""
+    column = pa.chunked_array([pa.array([Decimal("123"), None], type=pa.decimal64(10, 0))])
+
+    conformed = _conform_scalar_column(column, "INTEGER")
+
+    assert conformed.type == pa.int64()
+    assert conformed.to_pylist() == [123, None]
+
+
+def test_conform_scalar_column_leaves_unrecognized_resolved_types_alone():
+    """RECORD (and anything else outside _ADBC_INGEST_ARROW_TYPE) is out of scope --
+    _conform_denormalized has never touched nested struct columns."""
     column = pa.chunked_array([pa.array(["a", "b"])])
 
-    assert _conform_decimal_column(column, "FLOAT") is column
+    assert _conform_scalar_column(column, "RECORD") is column
 
 
-def test_conform_decimal_column_downcasts_integer_to_float64_for_a_float_column():
+def test_conform_scalar_column_downcasts_integer_to_float64_for_a_float_column():
     """adbc-driver-snowflake maps a NUMBER(38,0) column (scale 0) to a native Arrow
     integer type, not a decimal one -- but bigquery_type() has already created the
     physical column as FLOAT for the same "number" property, so the integer column must
     still downcast to match it, just like a decimal column does."""
     column = pa.chunked_array([pa.array([1, None], type=pa.int64())])
 
-    conformed = _conform_decimal_column(column, "FLOAT")
+    conformed = _conform_scalar_column(column, "FLOAT")
 
     assert conformed.type == pa.float64()
     assert conformed.to_pylist() == [1.0, None]
 
 
-def test_conform_decimal_column_casts_integer_to_decimal128_for_a_numeric_column():
+def test_conform_scalar_column_casts_integer_to_string_for_a_string_column():
     column = pa.chunked_array([pa.array([1, None], type=pa.int64())])
 
-    conformed = _conform_decimal_column(column, "NUMERIC")
+    conformed = _conform_scalar_column(column, "STRING")
 
-    assert conformed.type == pa.decimal128(38, 9)
-    assert conformed.to_pylist() == [Decimal("1.000000000"), None]
+    assert conformed.type == pa.string()
+    assert conformed.to_pylist() == ["1", None]
 
 
-def test_conform_decimal_column_leaves_integer_column_alone_for_an_integer_destination():
+def test_conform_scalar_column_leaves_integer_column_alone_for_an_integer_destination():
     """The normal case: an "integer" Singer property creates an INTEGER column, and a
     native Arrow integer source column already matches it -- nothing to conform."""
     column = pa.chunked_array([pa.array([1, None], type=pa.int64())])
 
-    assert _conform_decimal_column(column, "INTEGER") is column
+    assert _conform_scalar_column(column, "INTEGER") is column
 
 
 def test_conform_denormalized_downcasts_integer_column_for_a_float_destination():
@@ -862,8 +881,8 @@ def test_conform_denormalized_widens_decimal64_column_for_a_numeric_destination(
 
     conformed = _conform_denormalized(table, resolved_schema, {})
 
-    assert conformed.column("balance").type == pa.decimal128(10, 2)
-    assert conformed.column("balance").to_pylist() == table.column("balance").to_pylist()
+    assert conformed.column("balance").type == pa.decimal128(38, 9)
+    assert conformed.column("balance").to_pylist() == [Decimal("123.450000000"), None]
 
 
 def test_conform_denormalized_downcasts_decimal64_column_for_a_float_destination():
@@ -885,40 +904,24 @@ def _postgres_opaque_numeric_column(values: list[str | None]) -> pa.ChunkedArray
     return pa.chunked_array([pa.array(values, type=pa.string()).cast(opaque_type)])
 
 
-def test_is_postgres_opaque_numeric_true_for_the_postgres_adbc_driver_numeric_type():
-    assert _is_postgres_opaque_numeric(pa.opaque(pa.string(), "numeric", "PostgreSQL"))
-
-
-@pytest.mark.parametrize(
-    "arrow_type",
-    [
-        pa.string(),
-        pa.decimal128(10, 2),
-        pa.opaque(pa.string(), "numeric", "SomeOtherVendor"),
-        pa.opaque(pa.string(), "uuid", "PostgreSQL"),
-    ],
-)
-def test_is_postgres_opaque_numeric_false_for_anything_else(arrow_type):
-    assert not _is_postgres_opaque_numeric(arrow_type)
-
-
-def test_conform_decimal_column_casts_postgres_opaque_numeric_to_decimal128_for_a_numeric_column():
+def test_conform_scalar_column_casts_postgres_opaque_numeric_to_decimal128_for_a_numeric_column():
     """adbc-driver-postgresql never maps NUMERIC to a native Arrow decimal type -- even a
     precision-bounded column like NUMERIC(12,2) comes back as an opaque extension type
     whose storage is Postgres's own textual representation (e.g. "123.45"), which
-    pa.types.is_decimal() doesn't recognize at all."""
+    pa.types.is_decimal() doesn't recognize at all -- but pyarrow casts it straight
+    through like any other source type."""
     column = _postgres_opaque_numeric_column(["123.45", None])
 
-    conformed = _conform_decimal_column(column, "NUMERIC")
+    conformed = _conform_scalar_column(column, "NUMERIC")
 
     assert conformed.type == pa.decimal128(38, 9)
     assert conformed.to_pylist() == [Decimal("123.450000000"), None]
 
 
-def test_conform_decimal_column_casts_postgres_opaque_numeric_to_float64_for_a_float_column():
+def test_conform_scalar_column_casts_postgres_opaque_numeric_to_float64_for_a_float_column():
     column = _postgres_opaque_numeric_column(["123.45", None])
 
-    conformed = _conform_decimal_column(column, "FLOAT")
+    conformed = _conform_scalar_column(column, "FLOAT")
 
     assert conformed.type == pa.float64()
     assert conformed.to_pylist() == [123.45, None]

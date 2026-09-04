@@ -634,80 +634,47 @@ class BaseBigQuerySink(BatchSink):
             self.tally_record_written(total_written)
 
 
-def _is_postgres_opaque_numeric(arrow_type: pa.DataType) -> bool:
-    """Whether `arrow_type` is adbc-driver-postgresql's own representation for NUMERIC.
-
-    The official Postgres ADBC driver never maps NUMERIC to a native Arrow decimal type
-    at all -- an unbounded/unconstrained precision doesn't fit any fixed-width
-    decimal128/256, so even a precision-bounded column (e.g. NUMERIC(12,2)) comes back
-    as an `arrow.opaque` extension type whose storage is a plain string holding
-    Postgres's own textual representation (e.g. "123.45"), tagged
-    type_name="numeric"/vendor_name="PostgreSQL". pa.types.is_decimal() doesn't
-    recognize this at all -- it needs its own check before _conform_decimal_column can
-    do anything with it.
-    """
-    return (
-        isinstance(arrow_type, pa.OpaqueType)
-        and arrow_type.type_name == "numeric"
-        and arrow_type.vendor_name == "PostgreSQL"
-    )
+# The exact Arrow type the BigQuery ADBC driver requires to ingest each scalar BigQuery
+# SQL type, per https://adbc-drivers.org/drivers/bigquery/#types. RECORD and JSON are
+# deliberately absent: JSON gets its own orjson-encode branch in _conform_denormalized,
+# and RECORD is a nested struct _conform_denormalized has never touched.
+_ADBC_INGEST_ARROW_TYPE: dict[str, pa.DataType] = {
+    "STRING": pa.string(),
+    "INTEGER": pa.int64(),
+    "FLOAT": pa.float64(),
+    "BOOLEAN": pa.bool_(),
+    "NUMERIC": pa.decimal128(38, 9),
+    "BIGNUMERIC": pa.decimal256(76, 38),
+    "TIMESTAMP": pa.timestamp("us", tz="UTC"),
+    "DATE": pa.date32(),
+    "TIME": pa.time64("us"),
+}
 
 
-def _conform_decimal_column(column: pa.Array, resolved_type: str) -> pa.Array:
-    """Conform a decimal- or integer-valued column to `resolved_type`.
-
-    Handles native Arrow decimal32/64/128/256 columns (e.g. what the MySQL ADBC driver
-    emits for a DECIMAL column), adbc-driver-postgresql's opaque-numeric extension
-    columns (see _is_postgres_opaque_numeric), and native Arrow integer columns (e.g.
-    what adbc-driver-snowflake emits for a NUMBER(38,0) column, since a scale of 0
-    round-trips as an integer type rather than a decimal one) -- all need conforming,
-    just via different source representations.
+def _conform_scalar_column(column: pa.Array, resolved_type: str) -> pa.Array:
+    """Conform a scalar column to whatever Arrow type `resolved_type` requires.
 
     create_target() creates the physical BigQuery table from the Singer jsonschema
-    (bigquery_type() maps a plain "number" property to FLOAT, with no awareness of
-    decimal precision) before any BATCH data is ever processed -- so the destination
-    column's type is already fixed by the time a BATCH file arrives here, and BigQuery's
-    own load-job schema validation rejects a mismatch against it outright. This must
-    therefore conform *to* that already-created column type, not to whatever's most
-    natural for the source data:
+    before any BATCH data is ever processed -- so the destination column's type is
+    already fixed by the time a BATCH file arrives here, and BigQuery's own load-job
+    schema validation rejects a mismatch against it outright. Meanwhile, every ADBC
+    source driver is free to represent the "same" JSON Schema type however it likes: a
+    decimal32/64 column for a narrow MySQL DECIMAL, a Postgres arrow.opaque extension
+    type for NUMERIC, a native integer column for a scale-0 Snowflake NUMBER, etc. This
+    conforms *to* the already-created column type regardless of the source's own
+    representation, by casting straight to the Arrow type the ADBC driver requires --
+    rather than special-casing each source shape individually.
 
-    - NUMERIC/BIGNUMERIC: BigQuery's ADBC driver only supports ingesting
-      decimal128/decimal256 Arrow arrays -- a decimal32 or decimal64 column fails with
-      "not implemented: support for DECIMAL64" at adbc_ingest() time otherwise, and
-      neither an opaque-numeric nor an integer column is a decimal type at all as far as
-      the driver's concerned. All get cast to decimal128: widening a decimal32/64 column
-      always covers every value it could hold (max precision 38 vs. 18/9), and
-      decimal128(38, 9) matches BigQuery's own default NUMERIC precision/scale, which is
-      the best guess available since neither the opaque nor the integer type carries any
-      precision/scale of its own.
-    - FLOAT (in practice the only other case, per bigquery_type() today): cast to
-      float64 to match, at the cost of the same precision/rounding behavior a plain
-      "number"-typed property already has for every other target-bigquery ingestion
-      path (RECORD messages, gcs_stage, etc.) -- BATCH must behave the same way here,
-      not silently gain more precision than the column it's writing into can express.
-    - Anything else (in practice INTEGER, when a source's own scale-0 NUMBER/DECIMAL
-      column already matches an "integer" Singer property): leave native Arrow integer
-      columns alone -- the destination already agrees with the source's own type, so
-      there's nothing to conform.
+    A resolved type with no entry in _ADBC_INGEST_ARROW_TYPE (RECORD, or anything
+    unrecognized) is left alone, as is a column whose Arrow type already matches. Any
+    other cast is delegated to pyarrow, which raises rather than silently truncating or
+    corrupting a value it can't losslessly convert (e.g. a float with a fractional part
+    cast to INTEGER) -- the same safety property callers already relied on implicitly.
     """
-    if _is_postgres_opaque_numeric(column.type):
-        target = (
-            pa.decimal128(38, 9) if resolved_type in ("NUMERIC", "BIGNUMERIC") else pa.float64()
-        )
-        return column.cast(target)
-    if pa.types.is_integer(column.type):
-        if resolved_type in ("NUMERIC", "BIGNUMERIC"):
-            return column.cast(pa.decimal128(38, 9))
-        if resolved_type == "FLOAT":
-            return column.cast(pa.float64())
+    target = _ADBC_INGEST_ARROW_TYPE.get(resolved_type)
+    if target is None or column.type == target:
         return column
-    if not pa.types.is_decimal(column.type):
-        return column
-    if resolved_type in ("NUMERIC", "BIGNUMERIC"):
-        if pa.types.is_decimal32(column.type) or pa.types.is_decimal64(column.type):
-            return column.cast(pa.decimal128(column.type.precision, column.type.scale))
-        return column
-    return column.cast(pa.float64())
+    return column.cast(target)
 
 
 def _conform_denormalized(
@@ -718,8 +685,9 @@ def _conform_denormalized(
     """Conform an Arrow table's columns to an already-resolved BigQuery schema.
 
     Renames columns, drops unknown ones, JSON-encodes any column whose resolved type is
-    JSON, and conforms any decimal column to the resolved type (see
-    _conform_decimal_column). Conforms *to* an already-resolved schema; never infers one.
+    JSON, and casts any scalar column to whatever Arrow type its resolved type requires
+    (see _conform_scalar_column). Conforms *to* an already-resolved schema; never infers
+    one.
     """
     json_fields = {f.name for f in resolved_schema if f.field_type.upper() == "JSON"}
     resolved_types = {f.name: f.field_type.upper() for f in resolved_schema}
@@ -740,7 +708,7 @@ def _conform_denormalized(
                 type=pa.string(),
             )
         else:
-            column = _conform_decimal_column(column, resolved_types[conformed_name])
+            column = _conform_scalar_column(column, resolved_types[conformed_name])
         names.append(conformed_name)
         columns.append(column)
 
