@@ -801,10 +801,55 @@ def test_conform_decimal_column_downcasts_to_float64_for_a_float_column():
     assert conformed.to_pylist() == [123.45, None]
 
 
-def test_conform_decimal_column_leaves_non_decimal_types_alone():
-    column = pa.chunked_array([pa.array([1, 2])])
+def test_conform_decimal_column_leaves_non_numeric_types_alone():
+    column = pa.chunked_array([pa.array(["a", "b"])])
 
     assert _conform_decimal_column(column, "FLOAT") is column
+
+
+def test_conform_decimal_column_downcasts_integer_to_float64_for_a_float_column():
+    """adbc-driver-snowflake maps a NUMBER(38,0) column (scale 0) to a native Arrow
+    integer type, not a decimal one -- but bigquery_type() has already created the
+    physical column as FLOAT for the same "number" property, so the integer column must
+    still downcast to match it, just like a decimal column does."""
+    column = pa.chunked_array([pa.array([1, None], type=pa.int64())])
+
+    conformed = _conform_decimal_column(column, "FLOAT")
+
+    assert conformed.type == pa.float64()
+    assert conformed.to_pylist() == [1.0, None]
+
+
+def test_conform_decimal_column_casts_integer_to_decimal128_for_a_numeric_column():
+    column = pa.chunked_array([pa.array([1, None], type=pa.int64())])
+
+    conformed = _conform_decimal_column(column, "NUMERIC")
+
+    assert conformed.type == pa.decimal128(38, 9)
+    assert conformed.to_pylist() == [Decimal("1.000000000"), None]
+
+
+def test_conform_decimal_column_leaves_integer_column_alone_for_an_integer_destination():
+    """The normal case: an "integer" Singer property creates an INTEGER column, and a
+    native Arrow integer source column already matches it -- nothing to conform."""
+    column = pa.chunked_array([pa.array([1, None], type=pa.int64())])
+
+    assert _conform_decimal_column(column, "INTEGER") is column
+
+
+def test_conform_denormalized_downcasts_integer_column_for_a_float_destination():
+    """The failure this reproduces: adbc-driver-snowflake's Arrow BATCH mode extracts a
+    NUMBER(38,0) column (scale 0) as a native Arrow integer type, which BigQuery's ADBC
+    driver then infers as INTEGER at ingest time -- conflicting with the FLOAT column
+    bigquery_type() already created for the same "number" property, with "Field
+    c_custkey has changed type from FLOAT to INTEGER"."""
+    resolved_schema = [SchemaField("c_custkey", "FLOAT")]
+    table = pa.table({"c_custkey": pa.array([1, None], type=pa.int64())})
+
+    conformed = _conform_denormalized(table, resolved_schema, {})
+
+    assert conformed.column("c_custkey").type == pa.float64()
+    assert conformed.column("c_custkey").to_pylist() == [1.0, None]
 
 
 def test_conform_denormalized_widens_decimal64_column_for_a_numeric_destination():
