@@ -3,6 +3,6 @@ version = 1
 
 [[drivers]]
 name = 'bigquery'
-version = '1.12.2'
+version = '1.13.0'
 platform = 'macos_arm64'
-checksum = '9b8b050f1dc9a95004c84a1eae0ec03ea879c8984599775e80f344448a614af4'
+checksum = '849b0fbea8707a2976df3b7529c9ad0cbaeadd7253b7e0454118daee4afc065f'
