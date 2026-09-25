@@ -19,6 +19,7 @@ import time
 import traceback
 import uuid
 from abc import ABC, abstractmethod
+from typing import Protocol
 
 try:
     from functools import cache
@@ -96,6 +97,17 @@ class SchemaResolverVersion(Enum):
         return str(self.value)
 
 
+class RowIteratorProtocol(Protocol): ...
+
+
+class QueryJobProtocol(Protocol):
+    def result(self) -> RowIteratorProtocol: ...
+
+
+class ClientProtocol(Protocol):
+    def query(self, query: str) -> QueryJobProtocol: ...
+
+
 @dataclass
 class BigQueryTable:
     name: str
@@ -133,14 +145,31 @@ class BigQueryTable:
         """Returns the table name as as escaped SQL string."""
         return f"`{self.project}`.`{self.dataset}`.`{self.name}{suffix}`"
 
-    def get_resolved_schema(self, apply_transforms: bool = False) -> list[bigquery.SchemaField]:
-        """Returns the schema for this table after factoring in the ingestion strategy."""
+    def get_resolved_schema(
+        self,
+        apply_transforms: bool = False,
+        extra_fields: list[bigquery.SchemaField] | None = None,
+    ) -> list[bigquery.SchemaField]:
+        """Returns the schema for this table after factoring in the ingestion strategy.
+
+        `extra_fields`, when given, are appended for any field name not already present.
+        This lets a freshly created temp table be widened to a known superset (e.g. an
+        existing merge target's columns) even when this table's own `jsonschema` doesn't
+        mention them -- otherwise a column that dropped out of the source schema between
+        runs (e.g. a tap stopped returning a property) would be missing from the temp
+        table while still present on the merge target, and MERGE would fail with
+        "Name <column> not found inside source".
+        """
         if self.ingestion_strategy is IngestionStrategy.FIXED:
-            return DEFAULT_SCHEMA
+            schema = DEFAULT_SCHEMA
         elif self.ingestion_strategy is IngestionStrategy.DENORMALIZED:
-            return self.get_schema(apply_transforms)
+            schema = self.get_schema(apply_transforms)
         else:
             raise ValueError(f"Invalid ingestion strategy: {self.ingestion_strategy}")
+        if extra_fields:
+            known_names = {field.name for field in schema}
+            schema = [*schema, *(f for f in extra_fields if f.name not in known_names)]
+        return schema
 
     def __str__(self) -> str:
         return f"{self.project}.{self.dataset}.{self.name}"
@@ -153,14 +182,19 @@ class BigQueryTable:
         """Returns a DatasetReference for this table."""
         return bigquery.DatasetReference(self.project, self.dataset)
 
-    def as_table(self, apply_transforms: bool = False, **kwargs) -> bigquery.Table:
+    def as_table(
+        self,
+        apply_transforms: bool = False,
+        extra_schema: list[bigquery.SchemaField] | None = None,
+        **kwargs,
+    ) -> bigquery.Table:
         """Returns a Table instance for this table."""
         if hasattr(self, "_table"):
             return self._table
 
         table = bigquery.Table(
             self.as_ref(),
-            schema=self.get_resolved_schema(apply_transforms),
+            schema=self.get_resolved_schema(apply_transforms, extra_schema),
         )
         config = {**self.default_table_options(), **kwargs}
         for option, value in config.items():
@@ -179,13 +213,17 @@ class BigQueryTable:
         self,
         client: bigquery.Client,
         apply_transforms: bool = False,
+        extra_schema: list[bigquery.SchemaField] | None = None,
         **kwargs,
     ) -> bool:
         """Creates a dataset and table for this table.
 
         This is a convenience method that wraps the creation of a dataset and
         table in a single method call. It is idempotent and will not create
-        a new table if one already exists."""
+        a new table if one already exists.
+
+        `extra_schema`, when given, is unioned into the schema this table is created
+        with -- see `get_resolved_schema`."""
         if not hasattr(self, "_dataset"):
             try:
                 self._dataset = client.get_dataset(self.as_dataset_ref())
@@ -198,6 +236,7 @@ class BigQueryTable:
                 self._table = client.create_table(
                     self.as_table(
                         apply_transforms and self.ingestion_strategy != IngestionStrategy.FIXED,
+                        extra_schema=extra_schema,
                         **kwargs["table"],
                     )
                 )
@@ -348,6 +387,16 @@ class BaseBigQuerySink(BatchSink):
         self.increment_jobs_enqueued = target.increment_jobs_enqueued
 
     def _create_overwrite_table(self) -> None:
+        # If we're about to MERGE this temp table into `merge_target`, widen it to a
+        # superset of the merge target's already-existing columns. Otherwise a column
+        # that dropped out of *this run's* schema (e.g. the source stopped returning a
+        # property this stream had in a previous run) would be missing here while still
+        # present on the merge target, and merge_table()'s MERGE statement -- which is
+        # built from the merge target's columns -- would fail with "Name <column> not
+        # found inside source".
+        extra_schema = (
+            self.merge_target.as_table().schema if self.merge_target is not None else None
+        )
         self.table = BigQueryTable(
             name=f"{self.table_name}__{time.strftime('%Y%m%d%H%M%S')}__{uuid.uuid4()}",
             **self.table_opts,
@@ -355,6 +404,7 @@ class BaseBigQuerySink(BatchSink):
         self.table.create_table(
             self.client,
             self.apply_transforms,
+            extra_schema=extra_schema,
             table={
                 "expires": datetime.datetime.now(datetime.timezone.utc)
                 + datetime.timedelta(days=1),
@@ -536,7 +586,7 @@ class BaseBigQuerySink(BatchSink):
         """Return a worker class for the given parallelization type."""
         raise NotImplementedError
 
-    def merge_table(self, bigquery_client: bigquery.Client) -> None:
+    def merge_table(self, bigquery_client: ClientProtocol) -> None:
         target = self.merge_target.as_table()
         ordering_columns = ["_sdc_extracted_at", "_sdc_received_at"]
         tmp, ctas_tmp = None, "SELECT 1 AS _no_op"
