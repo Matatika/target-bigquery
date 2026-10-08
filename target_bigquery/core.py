@@ -594,9 +594,10 @@ class BaseBigQuerySink(BatchSink):
             # We can't use MERGE with a non-unique key, so we need to dedupe the temp table into
             # a _SESSION scoped intermediate table.
             tmp = f"{self.merge_target.name}__tmp"
+            # BigQuery cannot partition a window by a FLOAT64 key, but it can by its JSON text.
             dedupe_query = (
                 f"SELECT * FROM {self.table.get_escaped_name()} "
-                f"QUALIFY ROW_NUMBER() OVER (PARTITION BY {', '.join(f'`{p}`' for p in self.key_properties)} "
+                f"QUALIFY ROW_NUMBER() OVER (PARTITION BY {', '.join(f'TO_JSON_STRING(`{p}`)' for p in self.key_properties)} "
                 f"ORDER BY {', '.join(f'{c} DESC' for c in ordering_columns)}) = 1"
             )
             ctas_tmp = f"CREATE OR REPLACE TEMP TABLE `{tmp}` AS {dedupe_query}"

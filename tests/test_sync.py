@@ -200,6 +200,55 @@ def test_basic_denorm_sync(method):
     assert len(records) == 5
 
 
+def test_dedupe_before_upsert_float_key():
+    table_name = f"dedupe_float_key_{uuid.uuid4().hex[:8]}"
+    singer_input = io.StringIO(
+        "\n".join(
+            json.dumps(message)
+            for message in [
+                {
+                    "type": "SCHEMA",
+                    "stream": table_name,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "rank": {"type": ["number", "null"]},
+                            "title": {"type": ["string", "null"]},
+                        },
+                    },
+                    "key_properties": ["rank"],
+                },
+                {"type": "RECORD", "stream": table_name, "record": {"rank": 1.5, "title": "a"}},
+                {"type": "RECORD", "stream": table_name, "record": {"rank": 1.5, "title": "b"}},
+                {"type": "RECORD", "stream": table_name, "record": {"rank": 2.0, "title": "c"}},
+            ]
+        )
+    )
+
+    target = TargetBigQuery(
+        config={
+            "credentials_json": os.environ["BQ_CREDS"],
+            "project": os.environ["BQ_PROJECT"],
+            "dataset": os.environ["BQ_DATASET"],
+            "method": "batch_job",
+            "denormalized": True,
+            "upsert": True,
+            "dedupe_before_upsert": True,
+        },
+    )
+    target_sync_test(target, singer_input)
+
+    client = bigquery_client_factory(BigQueryCredentials(json=target.config["credentials_json"]))
+    ranks = [
+        row.rank
+        for row in client.query(
+            f"SELECT rank FROM {target.config['dataset']}.{table_name} ORDER BY rank"
+        ).result()
+    ]
+
+    assert ranks == [1.5, 2.0]
+
+
 @pytest.mark.parametrize(
     "method",
     ["batch_job", "streaming_insert", "gcs_stage", "storage_write_api"],
