@@ -1,5 +1,6 @@
 """Tests standard target features using the built-in SDK tests library."""
 
+import datetime
 import io
 import json
 import os
@@ -247,6 +248,64 @@ def test_dedupe_before_upsert_float_key():
     ]
 
     assert ranks == [1.5, 2.0]
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "batch_job",
+        "streaming_insert",
+        "storage_write_api",
+        pytest.param("gcs_stage", marks=GCS_STAGE_XFAIL),
+    ],
+    ids=["batch_job", "streaming_insert", "storage_write_api", "gcs_stage"],
+)
+def test_timestamp_with_offset_without_colon(method):
+    table_name = f"offset_without_colon_{method}_{uuid.uuid4().hex[:8]}"
+    singer_input = io.StringIO(
+        "\n".join(
+            json.dumps(message)
+            for message in [
+                {
+                    "type": "SCHEMA",
+                    "stream": table_name,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": ["integer", "null"]},
+                            "created": {"type": ["string", "null"], "format": "date-time"},
+                        },
+                    },
+                    "key_properties": ["id"],
+                },
+                {
+                    "type": "RECORD",
+                    "stream": table_name,
+                    "record": {"id": 1, "created": "2026-02-13T08:56:51.803+0100"},
+                },
+            ]
+        )
+    )
+
+    target = TargetBigQuery(
+        config={
+            "credentials_json": os.environ["BQ_CREDS"],
+            "project": os.environ["BQ_PROJECT"],
+            "dataset": os.environ["BQ_DATASET"],
+            "bucket": os.environ.get("GCS_BUCKET"),
+            "method": method,
+            "denormalized": True,
+        },
+    )
+    target_sync_test(target, singer_input)
+    time.sleep(10)  # wait for the eventual consistency seen in LoadJobs sinks
+
+    client = bigquery_client_factory(BigQueryCredentials(json=target.config["credentials_json"]))
+    [row] = client.query(f"SELECT created FROM {target.config['dataset']}.{table_name}").result()
+
+    assert row.created == datetime.datetime(
+        2026, 2, 13, 7, 56, 51, 803000, tzinfo=datetime.timezone.utc
+    )
 
 
 @pytest.mark.parametrize(

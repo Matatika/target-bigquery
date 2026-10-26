@@ -313,6 +313,8 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         return record
 
     def process_record(self, record: dict[str, Any], context: dict[str, Any]) -> None:
+        # The proto schema carries a timestamp as a string, and ParseDict rejects a datetime.
+        record = orjson.loads(orjson.dumps(record))
         self.proto_rows.serialized_rows.append(
             json_format.ParseDict(record, self.proto_schema()).SerializeToString()
         )
