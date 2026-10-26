@@ -26,6 +26,11 @@ try:
 except ImportError:
     from functools import lru_cache as cache
 
+if sys.version_info >= (3, 12):
+    from typing import override
+else:
+    from typing_extensions import override
+
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from copy import copy
@@ -490,8 +495,10 @@ class BaseBigQuerySink(BatchSink):
             "generate_view", False
         )
 
-    def _validate_and_parse(self, record: dict) -> dict:
-        return record
+    @override
+    def get_validator(self):
+        # BigQuery validates each row as it loads, so skip the in-flight JSON schema validation.
+        return None
 
     def _singer_validate_message(self, record: dict) -> None:
         """Ensure record conforms to Singer Spec.
