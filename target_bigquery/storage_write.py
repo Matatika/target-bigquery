@@ -100,6 +100,26 @@ def generate_request(
     return request
 
 
+def _inline_nested_types(proto_descriptor, descriptor) -> None:
+    """Define each message-typed field's type inside its parent ``DescriptorProto``.
+
+    The writer schema is a single self-contained ``DescriptorProto``: the Storage Write API can't
+    resolve a ``type_name`` that refers to a message defined elsewhere, so a RECORD column's
+    message has to live in ``nested_type`` or the stream fails to open.
+    """
+    from google.protobuf import descriptor_pb2
+
+    for field in proto_descriptor.field:
+        if field.type != descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE:
+            continue
+        nested = descriptor.fields_by_name[field.name].message_type
+        nested_proto = proto_descriptor.nested_type.add()
+        nested.CopyToProto(nested_proto)
+        nested_proto.name = f"{field.name}_t"
+        field.type_name = nested_proto.name
+        _inline_nested_types(nested_proto, nested)
+
+
 def generate_template(message: type[message.Message]):
     """Generate a template for the storage write API from a proto message class."""
     from google.protobuf import descriptor_pb2
@@ -111,6 +131,7 @@ def generate_template(message: type[message.Message]):
         types.AppendRowsRequest.ProtoData(),
     )
     message.DESCRIPTOR.CopyToProto(proto_descriptor)
+    _inline_nested_types(proto_descriptor, message.DESCRIPTOR)
     proto_schema.proto_descriptor = proto_descriptor
     proto_data.writer_schema = proto_schema
     template.proto_rows = proto_data

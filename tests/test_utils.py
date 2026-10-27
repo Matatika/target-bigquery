@@ -18,6 +18,7 @@ from target_bigquery.core import (
     transform_column_name,
 )
 from target_bigquery.proto_gen import proto_schema_factory_v2
+from target_bigquery.storage_write import generate_template
 
 
 @pytest.mark.parametrize(
@@ -940,3 +941,36 @@ def test_conform_denormalized_casts_postgres_opaque_numeric_column_for_a_float_d
 
     assert conformed.column("balance").type == pa.float64()
     assert conformed.column("balance").to_pylist() == [123.45, None]
+
+
+def test_storage_write_template_is_self_contained():
+    """The writer schema must define every nested RECORD itself.
+
+    The Storage Write API receives a single ``DescriptorProto`` and can't resolve a ``type_name`` that
+    refers to a message defined elsewhere, so such a stream fails to open.
+    """
+    jit = proto_schema_factory_v2(
+        [
+            SchemaField("name", "string"),
+            SchemaField(
+                "namespace",
+                "record",
+                fields=[
+                    SchemaField("database", "string"),
+                    SchemaField("inner", "record", fields=[SchemaField("collection", "string")]),
+                ],
+            ),
+        ],
+    )
+
+    descriptor = generate_template(jit).proto_rows.writer_schema.proto_descriptor
+
+    def assert_self_contained(proto):
+        nested = {n.name: n for n in proto.nested_type}
+        for field in proto.field:
+            if field.type == field.TYPE_MESSAGE:
+                assert field.type_name in nested
+                assert_self_contained(nested[field.type_name])
+
+    assert [n.name for n in descriptor.nested_type] == ["namespace_t"]
+    assert_self_contained(descriptor)
